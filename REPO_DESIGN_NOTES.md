@@ -47,7 +47,7 @@ LangGraph 的核心不是某一种 agent prompt 或某个 ReAct 模板，而是�
 | 目录 | 职责 | 重点代码 |
 |---|---|---|
 | `libs/langgraph` | 核心框架。提供 Graph API、Functional API、Pregel 运行时、channel、streaming、interrupt、runtime 注入等能力 | `langgraph/graph/state.py`, `langgraph/pregel/main.py`, `langgraph/pregel/_loop.py`, `langgraph/pregel/_algo.py`, `langgraph/channels/*.py`, `langgraph/runtime.py`, `langgraph/types.py`, `langgraph/func/__init__.py` |
-| `libs/prebuilt` | 高层 agent 和 tool 组件。把核心 graph primitives 组合成常见 agent 模式（`create_react_agent` 已 deprecate，转向 `langchain.agents.create_agent`，但 `ToolNode` 仍是核心可用组件） | `prebuilt/chat_agent_executor.py`, `prebuilt/tool_node.py` |
+| `libs/prebuilt` | 高层 agent 和 tool 组件。源码位于 `langgraph.prebuilt` namespace，用核心 graph primitives 组合常见 agent 模式（`create_react_agent` 已 deprecate，转向 `langchain.agents.create_agent`，但 `ToolNode` 仍是核心可用组件） | `prebuilt/chat_agent_executor.py`, `prebuilt/tool_node.py` |
 | `libs/checkpoint` | checkpoint、store、cache、serde 的基础接口和内存实现 | `checkpoint/base/__init__.py`, `checkpoint/memory/__init__.py`, `checkpoint/serde/{jsonplus,_msgpack,encrypted,event_hooks}.py`, `store/base/__init__.py`, `cache/base/__init__.py`, `cache/memory/__init__.py`, `cache/redis/__init__.py` |
 | `libs/checkpoint-sqlite` | SQLite checkpointer/store/cache 实现，适合轻量本地或 demo | `checkpoint/sqlite/*.py`, `store/sqlite/*.py` |
 | `libs/checkpoint-postgres` | Postgres checkpointer/store 实现，面向生产持久化。同时提供 `ShallowPostgresSaver`（只保留最新 checkpoint，无 time travel 但成本更低） | `checkpoint/postgres/__init__.py`, `checkpoint/postgres/shallow.py`, `checkpoint/postgres/aio.py`, `store/postgres/*.py` |
@@ -59,14 +59,16 @@ LangGraph 的核心不是某一种 agent prompt 或某个 ReAct 模板，而是�
 依赖箭头 `A → B` 表示 A 依赖 B：
 
 ```text
-langgraph              → checkpoint, sdk-py
+langgraph              → checkpoint, sdk-py, prebuilt
 cli                    → sdk-py
-prebuilt               → checkpoint, langgraph
+prebuilt               → checkpoint
 checkpoint-postgres    → checkpoint
 checkpoint-sqlite      → checkpoint
 checkpoint-conformance → checkpoint
 sdk-js                 独立仓库
 ```
+
+注意：上图按各库 `pyproject.toml` / `package.json` 中声明的 production dependencies 统计。`libs/prebuilt` 源码在 monorepo 内会导入 `langgraph` 核心模块，但当前 `libs/prebuilt/pyproject.toml` 没把 `langgraph` 声明为 production dependency；发布依赖关系上是 `langgraph` 依赖 `langgraph-prebuilt`。
 
 这个拆分体现了一个重要理念：运行时、持久化协议、具体存储、预置 agent、部署/SDK 是不同稳定层级。agent 框架要长期演进，不能把“怎么跑图”和“怎么存图状态”绑死在同一个包里。
 
@@ -362,15 +364,15 @@ PregelRunner 并发执行 tasks
 
 ### Schema 层级
 
-LangGraph 区分四类 schema，加上 managed value，可以解释“哪些字段是节点共享的状态，哪些是注入依赖，哪些不会暴露给 LLM”：
+LangGraph 区分四类 schema，加上 managed value，可以解释“哪些字段是节点共享的状态，哪些是运行期依赖，哪些只约束 graph I/O，哪些不会进入工具 schema”：
 
-| schema | 角色 | 是否进入 channel | 是否对 LLM 可见 | 注入方式 |
+| schema | 角色 | 是否进入 channel / 运行时状态 | 是否自动暴露给 LLM | 注入方式 |
 |---|---|---|---|---|
-| `state_schema` | 节点共享读写状态 | 是 | 默认是 | 节点入参 `state` |
-| `input_schema` | 外部输入子集 | 仅 START 写入 | 是 | `invoke({...})` 的入参形状 |
-| `output_schema` | 外部输出子集 | 由对应字段映射 | 是 | `invoke()` 的返回形状 |
+| `state_schema` | 节点共享读写状态 | 是 | 否；只有节点或 prebuilt agent 显式把字段放进 prompt / model input 时才可见 | 节点入参 `state` |
+| `input_schema` | 外部输入子集 | 仅 START 写入对应字段 | 否；它只约束 `invoke({...})` 输入形状 | `invoke({...})` 的入参形状 |
+| `output_schema` | 外部输出子集 | 由对应字段映射 | 否；它只约束 `invoke()` 返回形状 | `invoke()` 的返回形状 |
 | `context_schema` | 运行期 context（静态依赖，如 user_id、db 连接） | 否 | 否 | `Runtime.context` |
-| managed value | 框架管理字段（如 `RemainingSteps`） | 是 | 否 | 节点入参，但不出现在 IO schema |
+| managed value | 框架管理字段（如 `RemainingSteps`） | 作为 managed value 挂在运行时，不是普通 channel | 否 | 节点入参可读，但不出现在 IO schema |
 
 设计启发：把“需要持久化的状态”、“运行期注入的依赖”、“不应进入 prompt 的内部信号”从一开始就分开，不要全塞进一个大 dict。
 
@@ -610,8 +612,8 @@ class State(TypedDict):
 | `EphemeralValue` | 触发下游 | 仅在写入的下一 superstep 可见，不会持久化为长期状态 | 信号、一次性指令 |
 | `AnyValue` | 触发下游 | 接受任意写入，不抛冲突错误 | “只要有人写就行”的状态位 |
 | `NamedBarrierValue` / `NamedBarrierValueAfterFinish` | 等命名节点都写入后才触发 | 类似 BSP join | map-reduce、多 agent 等待 |
-| `UntrackedValue` | **不触发**下游 | 写入不推进版本 | 只暴露给节点读、不参与调度的字段 |
-| `DeltaChannel` | 触发下游 | 只存增量，周期性写 `_DeltaSnapshot`；重建走 `get_delta_channel_history` | 大状态、长历史，降低 checkpoint 成本 |
+| `UntrackedValue` | 触发下游（当前运行内） | 保存最后一次写入并推进版本，但 `checkpoint()` 返回 `MISSING`，持久化 pending writes 时也会过滤该 channel | 不可序列化的运行期对象、只在当前执行中传递的资源 |
+| `DeltaChannel` | 触发下游 | 非快照 step 不写入 `channel_values`，只通过 `checkpoint_writes` 保留增量；周期性写 `_DeltaSnapshot`；重建走 `get_delta_channel_history` | 大状态、长历史，降低 checkpoint 成本 |
 
 特别提醒 `LastValue` 的并发语义：在同一个 superstep 内多个节点同时写 `LastValue` 通道会抛 `InvalidUpdateError`，只有跨 superstep 的覆盖才是“后写胜出”。如果业务允许任意覆盖，应改用 `AnyValue`；如果是累加/合并，应配 reducer。
 
@@ -621,8 +623,8 @@ managed value 不是 channel，它通过 `_get_channels()` 中专门的分支处
 
 DeltaChannel 是这个仓库里比较新且有工程意义的设计。当 agent 状态本身就是“长链表 / 大 list / 持续累加”的形态（消息历史、向量索引、累加日志），常规 channel 每步都把全量值进 checkpoint，成本会随步数线性增长。DeltaChannel 把这件事改成增量：
 
-- 大部分 step 的 `channel_values[k]` 只存哨兵 `_DeltaSnapshot`，真正的更新落在该 step 的 `checkpoint_writes` 里。
-- 每隔 `snapshot_frequency` 次更新（或达到 `DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT` 总步数上限）写一个完整 `_DeltaSnapshot` 到 `channel_values`。
+- 非快照 step 的 `channel_values` 里不包含该 channel；该 step 的真实更新保存在 `checkpoint_writes` / `pending_writes` 里。
+- 每隔 `snapshot_frequency` 次更新（或达到 `DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT` 总步数上限）才把完整 `_DeltaSnapshot(value)` 写到 `channel_values[k]`。
 - 状态重建时由 `BaseCheckpointSaver.get_delta_channel_history(config, channels)` 沿 `parent_config` 往上走，累计每个 channel 的 writes，直到遇到最近的 snapshot，组合出当前值。
 - metadata 中的 `counters_since_delta_snapshot[channel] = (updates, supersteps)` 控制何时强制 snapshot。
 
@@ -714,7 +716,7 @@ LangGraph 用两个基础类型处理：
 
 ### Cache 子系统
 
-- `libs/checkpoint/langgraph/cache/base/__init__.py` 定义 `BaseCache` 和 `CacheNamespace`。
+- `libs/checkpoint/langgraph/cache/base/__init__.py` 定义 `BaseCache`、`Namespace` 和 `FullKey`。
 - 内存实现 `cache/memory/__init__.py`，Redis 实现 `cache/redis/__init__.py`，SQLite 实现见 `libs/checkpoint-sqlite`。
 - `CachePolicy(key_func, ttl)` 是节点级缓存配置：
   - `key_func` 默认基于 pickle 哈希节点输入，但**生产环境通常需要自定义**——一方面避免 pickle 不稳定的对象，另一方面对敏感字段排除。
@@ -727,10 +729,10 @@ LangGraph 用两个基础类型处理：
 
 - `JsonPlusSerializer`：默认序列化器，处理 LangChain 对象、datetime、enum 等扩展类型。
 - `_msgpack.py`：性能更高的二进制路径。
-- `encrypted.py`：字段级加密，配合 `langgraph_sdk.encryption` 在 server 边界统一处理。
-- `event_hooks.py`：序列化挂钩，便于审计、脱敏、追踪。
+- `encrypted.py`：对序列化后的 checkpoint/blob 数据做加密包装；server 侧更细粒度的 JSON / 字段加密由 `langgraph_sdk.encryption` 的自定义 at-rest encryption 体系处理。
+- `event_hooks.py`：序列化 allowlist 事件挂钩，便于记录和审计反序列化安全事件。
 
-SerDe 是“跨语言互操作（与 sdk-js）”和“合规存储（字段级加密、PII 脱敏）”的关键，不要轻易绕过。
+SerDe 是跨进程 / 跨版本互操作和合规存储（blob 加密、自定义 JSON / 字段加密、PII 脱敏）的关键，不要轻易绕过。
 
 ## Runtime 注入：`Runtime` 与 `ToolRuntime`
 
@@ -746,7 +748,7 @@ SerDe 是“跨语言互操作（与 sdk-js）”和“合规存储（字段级�
 
 `Runtime` 本身**不含 `RunnableConfig`**。要拿 `config`，要么在节点签名里加 `config: RunnableConfig`，要么用 `langgraph.config.get_config()`。
 
-`ToolRuntime`（`libs/prebuilt/langgraph/prebuilt/tool_node.py`）是它的子类，在工具场景里额外提供 `state`、`tool_call_id`、`config`。它和 `InjectedState`、`InjectedStore` 一起，让工具拿到 graph state 与 store 的同时不污染给 LLM 看到的工具签名。
+`ToolRuntime`（`libs/prebuilt/langgraph/prebuilt/tool_node.py`）不是 `Runtime` 的子类，而是独立的直接注入 tool 参数类型。它在工具场景里提供 `state`、`tool_call_id`、`config`，同时承载与 `Runtime` 对应的 `context`、`store`、`stream_writer`、`execution_info` 等运行期字段。它和 `InjectedState`、`InjectedStore` 一起，让工具拿到 graph state 与 store 的同时不污染给 LLM 看到的工具签名。
 
 设计启发：把“依赖”从“数据”里分出来。state 是要持久化、要让节点合并的；context、store、stream_writer 是运行期注入的能力，混在一起会让 schema 又脏又难恢复。
 
@@ -779,7 +781,7 @@ END 或 generate_structured_response
 - `pre_model_hook` 做消息裁剪、摘要等（未来由 middleware 取代）。
 - `post_model_hook` 做人工审核、guardrails、校验等（未来由 middleware 取代）。
 - `response_format` 做最终结构化输出。
-- `version="v1" | "v2"`：v1 顺序工具调用，v2 用 `Send` 把多个 tool call 分发到多个 `tools` 实例并行执行。并行模式下工具的副作用需要幂等。
+- `version="v1" | "v2"`：v1 由单个 `ToolNode` 处理一条 message，并在该节点内部并行执行多个 tool call；v2 用 `Send` 把每个 tool call 分发到多个 `tools` 任务 / 实例并行执行。并行模式下工具的副作用需要幂等。
 - `checkpointer` 和 `store` 直接透传到底层 graph。
 
 `ToolNode` 仍是**当前推荐**直接使用的组件，它体现了工具执行节点的工程化边界：
