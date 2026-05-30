@@ -51,7 +51,7 @@ LangGraph 的核心不是某一种 agent prompt 或某个 ReAct 模板，而是�
 | 目录 | 职责 | 重点代码 |
 |---|---|---|
 | `libs/langgraph` | 核心框架。提供 Graph API、Functional API、Pregel 运行时、channel、streaming、interrupt、runtime 注入、RemoteGraph 和 UI state helper 等能力 | `langgraph/graph/state.py`, `langgraph/pregel/main.py`, `langgraph/pregel/_loop.py`, `langgraph/pregel/_algo.py`, `langgraph/pregel/remote.py`, `langgraph/stream/*.py`, `langgraph/graph/ui.py`, `langgraph/channels/*.py`, `langgraph/runtime.py`, `langgraph/types.py`, `langgraph/func/__init__.py` |
-| `libs/prebuilt` | 高层 agent 和 tool 组件。源码位于 `langgraph.prebuilt` namespace，用核心 graph primitives 组合常见 agent 模式（`create_react_agent` 已 deprecate，转向 `langchain.agents.create_agent`，但 `ToolNode` 仍是核心可用组件） | `prebuilt/chat_agent_executor.py`, `prebuilt/tool_node.py` |
+| `libs/prebuilt` | 高层 agent 和 tool 组件。源码位于 `langgraph.prebuilt` namespace，用核心 graph primitives 组合常见 agent 模式（`create_react_agent` 当前仍在这里实现并导出，但已标记 deprecated，迁移方向是 `langchain.agents.create_agent`；`ToolNode` 仍是核心可用组件） | `prebuilt/chat_agent_executor.py`, `prebuilt/tool_node.py` |
 | `libs/checkpoint` | checkpoint、store、cache、serde 的基础接口和内存实现 | `checkpoint/base/__init__.py`, `checkpoint/memory/__init__.py`, `checkpoint/serde/{jsonplus,_msgpack,encrypted,event_hooks}.py`, `store/base/__init__.py`, `cache/base/__init__.py`, `cache/memory/__init__.py`, `cache/redis/__init__.py` |
 | `libs/checkpoint-sqlite` | SQLite checkpointer/store/cache 实现，适合轻量本地或 demo | `checkpoint/sqlite/*.py`, `store/sqlite/*.py`, `cache/sqlite/*.py` |
 | `libs/checkpoint-postgres` | Postgres checkpointer/store 实现，面向生产持久化。同时提供 `ShallowPostgresSaver`（只保留最新 checkpoint，无 time travel 但成本更低） | `checkpoint/postgres/__init__.py`, `checkpoint/postgres/shallow.py`, `checkpoint/postgres/aio.py`, `store/postgres/*.py` |
@@ -353,7 +353,7 @@ PregelRunner 并发执行 tasks
 
 - `invoke()` 是同步收集最终值，`stream()` 才是底层主入口。
 - stream 支持 `values`, `updates`, `messages`, `custom`, `checkpoints`, `tasks`, `debug` 七种模式（定义在 `langgraph/types.py` 的 `StreamMode`），说明可观察性是运行时的一等能力。
-- `durability` 有 `sync`, `async`, `exit` 三种模式（定义在 `langgraph/types.py` 的 `Durability`），允许在可靠性和吞吐之间权衡；旧的 `checkpoint_during=True/False` 已 deprecate。
+- `durability` 有 `sync`, `async`, `exit` 三种模式（定义在 `langgraph/types.py` 的 `Durability`），允许在可靠性和吞吐之间权衡；旧的 `checkpoint_during=True/False` 已 deprecate，但当前 SDK 里仍保留兼容入口并发出弃用告警。
 - 子图也是 runnable，可以嵌套并继承或隔离 checkpointer，每个子图有独立的 `checkpoint_ns`。
 
 ## Graph API 的职责边界
@@ -616,12 +616,12 @@ class State(TypedDict):
 | `BinaryOperatorAggregate` | 触发下游 | 用 reducer 函数（如 `operator.add`）合并多写 | 累加器、list/dict 拼接 |
 | `Topic` | 触发下游 | 发布订阅队列，支持 list 写入扁平化，可配置是否跨 step 累积；当前实现不做去重 | 任务分发、消息总线 |
 | `EphemeralValue` | 触发下游 | 保存上一步写入，下一次无写入时清空；它仍会进入 checkpoint，以便恢复时保持 step 边界语义 | 信号、一次性指令 |
-| `AnyValue` | 触发下游 | 同一 superstep 可接受多个写入并保存最后一个；设计假设多写值等价，适合“不关心哪个相同值赢”的场景 | 多路相同信号、容忍重复写的状态位 |
+| `AnyValue` | 触发下游 | 同一 superstep 可接受多个写入并保存最后一个；与 `EphemeralValue` 一样，下一次无写入时会清空。设计假设多写值等价，但当前实现不主动校验相等性 | 多路相同信号、容忍重复写的状态位 |
 | `NamedBarrierValue` / `NamedBarrierValueAfterFinish` | 等命名节点都写入后才触发 | 类似 BSP join | map-reduce、多 agent 等待 |
 | `UntrackedValue` | 触发下游（当前运行内） | 保存最后一次写入并推进版本，但 `checkpoint()` 返回 `MISSING`，持久化 pending writes 时也会过滤该 channel | 不可序列化的运行期对象、只在当前执行中传递的资源 |
 | `DeltaChannel` | 触发下游 | 非快照 step 不写入 `channel_values`，只通过 `checkpoint_writes` 保留增量；周期性写 `_DeltaSnapshot`；重建走 `get_delta_channel_history` | 大状态、长历史，降低 checkpoint 成本 |
 
-特别提醒 `LastValue` 的并发语义：在同一个 superstep 内多个节点同时写 `LastValue` 通道会抛 `InvalidUpdateError`，只有跨 superstep 的覆盖才是“后写胜出”。如果多路写的是等价值、只想避免冲突，可用 `AnyValue`；如果是累加/合并，应配 reducer；如果是聚合字段偶尔需要清空或替换，应显式返回 `Overwrite(value=...)`。
+特别提醒 `LastValue` 的并发语义：在同一个 superstep 内多个节点同时写 `LastValue` 通道会抛 `InvalidUpdateError`，只有跨 superstep 的覆盖才是“后写胜出”。如果多路写的是等价值、只想避免冲突，可用 `AnyValue`；但 `AnyValue` 只是“允许多写 + 取最后一个”的轻量通道，不会替你做相等性断言，也不会像 `LastValue` 那样长期保留旧值。如果是累加/合并，应配 reducer；如果是聚合字段偶尔需要清空或替换，应显式返回 `Overwrite(value=...)`。
 
 managed value 不是 channel，它通过 `_get_channels()` 中专门的分支处理，不进入 IO schema，但节点可以读到（例如 `RemainingSteps` 用来感知剩余递归预算）。
 
@@ -903,11 +903,11 @@ SerDe 是跨进程 / 跨版本互操作和合规存储（blob 加密、自定义
 
 `libs/prebuilt` 提供 `create_react_agent` 和 `ToolNode`。它不是核心，而是“用核心 primitives 组合出的参考实现”。
 
-> **重要**：`create_react_agent` 已在 LangGraph v1.0 标记为 `deprecated`，源码中的 docstring 直接指向迁移目标：
+> **重要**：`create_react_agent` 现在仍在 `langgraph.prebuilt` 中实现并导出，但已在 LangGraph v1.0 标记为 `deprecated`，源码中的 decorator 和 docstring 都直接指向迁移目标：
 >
 > > `create_react_agent` has been moved to `langchain.agents`. Please update your import to `from langchain.agents import create_agent`.
 >
-> 新的 `langchain.agents.create_agent` 引入了 **middleware 系统**（统一 pre/post hook、guardrails、observability、retries 的扩展点），替代了 LangGraph 端原本的 `pre_model_hook` / `post_model_hook`。`prebuilt/chat_agent_executor.py` 现在主要是兼容层和迁移引导。
+> 新的 `langchain.agents.create_agent` 引入了 **middleware 系统**（统一 pre/post hook、guardrails、observability、retries 的扩展点），替代了 LangGraph 端原本的 `pre_model_hook` / `post_model_hook`。因此 `prebuilt/chat_agent_executor.py` 既是当前实现所在处，也是迁移引导与兼容层。
 
 但 `create_react_agent` 的结构仍然是理解 ReAct 模式如何映射到 graph primitives 的好教材：
 
