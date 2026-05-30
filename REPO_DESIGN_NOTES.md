@@ -12,6 +12,7 @@
 - [Graph API 的职责边界](#graph-api-的职责边界)
 - [Node 输出与 State 更新语义](#node-输出与-state-更新语义)
 - [Channel 与 reducer 的设计价值](#channel-与-reducer-的设计价值)
+- [Reducer 覆盖：`Overwrite`](#reducer-覆盖overwrite)
 - [DeltaChannel：增量存储与可恢复重建](#deltachannel增量存储与可恢复重建)
 - [`Send` 和 `Command`：动态控制流](#send-和-command动态控制流)
 - [Subgraph 与 namespace](#subgraph-与-namespace)
@@ -21,8 +22,10 @@
 - [Prebuilt agent 的真实位置（含 deprecation 说明）](#prebuilt-agent-的真实位置含-deprecation-说明)
 - [Functional API 的定位](#functional-api-的定位)
 - [Streaming 与 observability](#streaming-与-observability)
+- [Stream v3 与 transformer](#stream-v3-与-transformer)
 - [错误处理、重试、缓存和超时](#错误处理重试缓存和超时)
 - [CLI 和 SDK 的职责](#cli-和-sdk-的职责)
+- [RemoteGraph 和 Server/UI 扩展](#remotegraph-和-serverui-扩展)
 - [值得吸收的设计理念](#值得吸收的设计理念)
 - [如果你要开发自己的 agent 项目](#如果你要开发自己的-agent-项目)
 - [推荐阅读顺序](#推荐阅读顺序)
@@ -46,14 +49,14 @@ LangGraph 的核心不是某一种 agent prompt 或某个 ReAct 模板，而是�
 
 | 目录 | 职责 | 重点代码 |
 |---|---|---|
-| `libs/langgraph` | 核心框架。提供 Graph API、Functional API、Pregel 运行时、channel、streaming、interrupt、runtime 注入等能力 | `langgraph/graph/state.py`, `langgraph/pregel/main.py`, `langgraph/pregel/_loop.py`, `langgraph/pregel/_algo.py`, `langgraph/channels/*.py`, `langgraph/runtime.py`, `langgraph/types.py`, `langgraph/func/__init__.py` |
+| `libs/langgraph` | 核心框架。提供 Graph API、Functional API、Pregel 运行时、channel、streaming、interrupt、runtime 注入、RemoteGraph 和 UI state helper 等能力 | `langgraph/graph/state.py`, `langgraph/pregel/main.py`, `langgraph/pregel/_loop.py`, `langgraph/pregel/_algo.py`, `langgraph/pregel/remote.py`, `langgraph/stream/*.py`, `langgraph/graph/ui.py`, `langgraph/channels/*.py`, `langgraph/runtime.py`, `langgraph/types.py`, `langgraph/func/__init__.py` |
 | `libs/prebuilt` | 高层 agent 和 tool 组件。源码位于 `langgraph.prebuilt` namespace，用核心 graph primitives 组合常见 agent 模式（`create_react_agent` 已 deprecate，转向 `langchain.agents.create_agent`，但 `ToolNode` 仍是核心可用组件） | `prebuilt/chat_agent_executor.py`, `prebuilt/tool_node.py` |
 | `libs/checkpoint` | checkpoint、store、cache、serde 的基础接口和内存实现 | `checkpoint/base/__init__.py`, `checkpoint/memory/__init__.py`, `checkpoint/serde/{jsonplus,_msgpack,encrypted,event_hooks}.py`, `store/base/__init__.py`, `cache/base/__init__.py`, `cache/memory/__init__.py`, `cache/redis/__init__.py` |
-| `libs/checkpoint-sqlite` | SQLite checkpointer/store/cache 实现，适合轻量本地或 demo | `checkpoint/sqlite/*.py`, `store/sqlite/*.py` |
+| `libs/checkpoint-sqlite` | SQLite checkpointer/store/cache 实现，适合轻量本地或 demo | `checkpoint/sqlite/*.py`, `store/sqlite/*.py`, `cache/sqlite/*.py` |
 | `libs/checkpoint-postgres` | Postgres checkpointer/store 实现，面向生产持久化。同时提供 `ShallowPostgresSaver`（只保留最新 checkpoint，无 time travel 但成本更低） | `checkpoint/postgres/__init__.py`, `checkpoint/postgres/shallow.py`, `checkpoint/postgres/aio.py`, `store/postgres/*.py` |
 | `libs/checkpoint-conformance` | checkpointer 合规测试套件，约束第三方持久化实现的行为 | `checkpoint/conformance/spec/*.py` |
 | `libs/cli` | LangGraph 应用创建、开发、本地服务、Docker 构建和部署入口。读取 `langgraph.json`、解析依赖、生成 Dockerfile、注入 `langgraph-api` 运行时 | `langgraph_cli/cli.py`, `langgraph_cli/config.py`, `langgraph_cli/docker.py`, `langgraph_cli/templates.py`, `langgraph_cli/schemas.py` |
-| `libs/sdk-py` | 调用 LangGraph Server / LangSmith Deployment REST API 的 Python SDK，覆盖 assistants/threads/runs/store/**cron** 等资源 | `langgraph_sdk/_async`, `langgraph_sdk/_sync`, `langgraph_sdk/auth/`, `langgraph_sdk/encryption/` |
+| `libs/sdk-py` | 调用 LangGraph Server / LangSmith Deployment REST API 的 Python SDK，覆盖 assistants/threads/runs/store/**cron**、远程 streaming、auth、encryption 等资源 | `langgraph_sdk/_async`, `langgraph_sdk/_sync`, `langgraph_sdk/stream/`, `langgraph_sdk/auth/`, `langgraph_sdk/encryption/` |
 | `libs/sdk-js` | JS SDK 已迁移到独立仓库 [`langchain-ai/langgraphjs`](https://github.com/langchain-ai/langgraphjs)，这里只保留 README 指引 | `README.md` |
 
 依赖箭头 `A → B` 表示 A 依赖 B：
@@ -206,6 +209,7 @@ LangGraph 把每个 state key 的更新语义前置到 channel/reducer：
 - `BinaryOperatorAggregate` 表示可聚合字段，例如 list concat 或计数累加。
 - `add_messages` 这类 reducer 表示按消息 ID 合并和覆盖。
 - `Topic`、`NamedBarrierValue`、`DeltaChannel` 等 channel 进一步表达发布订阅、等待汇合、增量存储等不同语义。
+- `Overwrite` 可以在少数场景下绕过 reducer，直接替换一个聚合 channel 的值，但同一 superstep 只能有一个覆盖写。
 
 这解决的是：并发合并规则不应该藏在节点内部，也不应该靠运行顺序碰运气。状态 schema 本身要表达执行语义。
 
@@ -258,7 +262,7 @@ LangGraph 把稳定状态和中间写入分开：
 
 LLM 输出的 tool calls 数量、map-reduce 的 item 数量、下一步是否走人工审核，都是运行时才知道的。静态边只能表达固定 workflow，不够表达这些动态分支。
 
-`Send(node, arg)` 用来动态创建目标节点任务，常见于 fan-out；`Command(update=..., goto=...)` 用一个返回值同时表达状态更新和控制跳转。它们的关键价值是：动态控制流仍然进入 Pregel 的 task、channel、checkpoint、stream 机制，不会绕开运行时。
+`Send(node, arg, timeout=...)` 用来动态创建目标节点任务，常见于 fan-out；`Command(update=..., goto=...)` 用一个返回值同时表达状态更新和控制跳转。它们的关键价值是：动态控制流仍然进入 Pregel 的 task、channel、checkpoint、stream 机制，不会绕开运行时。
 
 ### Thread / Store：解决 memory 概念混乱
 
@@ -361,6 +365,7 @@ PregelRunner 并发执行 tasks
 - 给节点配置 retry、cache、timeout、error handler、defer。
 - 校验图结构，例如必须有 `START` 到某个节点的入口。
 - 编译成可执行 `CompiledStateGraph`，并允许 compile 时声明 `interrupt_before` / `interrupt_after`。
+- compile 时注入 `checkpointer`、`cache`、`store` 和 v3 streaming `transformers`；运行时 `stream()` / `astream()` 也可以临时覆盖 interrupt 和 durability 等执行参数。
 
 ### Schema 层级
 
@@ -608,16 +613,40 @@ class State(TypedDict):
 |---|---|---|---|
 | `LastValue` | 触发下游 | 单步内禁止多写（否则 `InvalidUpdateError`），跨步覆盖 | 最终结果、单值字段 |
 | `BinaryOperatorAggregate` | 触发下游 | 用 reducer 函数（如 `operator.add`）合并多写 | 累加器、list/dict 拼接 |
-| `Topic` | 触发下游 | 发布订阅队列，可选去重、可选累积 | 任务分发、消息总线 |
-| `EphemeralValue` | 触发下游 | 仅在写入的下一 superstep 可见，不会持久化为长期状态 | 信号、一次性指令 |
-| `AnyValue` | 触发下游 | 接受任意写入，不抛冲突错误 | “只要有人写就行”的状态位 |
+| `Topic` | 触发下游 | 发布订阅队列，支持 list 写入扁平化，可配置是否跨 step 累积；当前实现不做去重 | 任务分发、消息总线 |
+| `EphemeralValue` | 触发下游 | 保存上一步写入，下一次无写入时清空；它仍会进入 checkpoint，以便恢复时保持 step 边界语义 | 信号、一次性指令 |
+| `AnyValue` | 触发下游 | 同一 superstep 可接受多个写入并保存最后一个；设计假设多写值等价，适合“不关心哪个相同值赢”的场景 | 多路相同信号、容忍重复写的状态位 |
 | `NamedBarrierValue` / `NamedBarrierValueAfterFinish` | 等命名节点都写入后才触发 | 类似 BSP join | map-reduce、多 agent 等待 |
 | `UntrackedValue` | 触发下游（当前运行内） | 保存最后一次写入并推进版本，但 `checkpoint()` 返回 `MISSING`，持久化 pending writes 时也会过滤该 channel | 不可序列化的运行期对象、只在当前执行中传递的资源 |
 | `DeltaChannel` | 触发下游 | 非快照 step 不写入 `channel_values`，只通过 `checkpoint_writes` 保留增量；周期性写 `_DeltaSnapshot`；重建走 `get_delta_channel_history` | 大状态、长历史，降低 checkpoint 成本 |
 
-特别提醒 `LastValue` 的并发语义：在同一个 superstep 内多个节点同时写 `LastValue` 通道会抛 `InvalidUpdateError`，只有跨 superstep 的覆盖才是“后写胜出”。如果业务允许任意覆盖，应改用 `AnyValue`；如果是累加/合并，应配 reducer。
+特别提醒 `LastValue` 的并发语义：在同一个 superstep 内多个节点同时写 `LastValue` 通道会抛 `InvalidUpdateError`，只有跨 superstep 的覆盖才是“后写胜出”。如果多路写的是等价值、只想避免冲突，可用 `AnyValue`；如果是累加/合并，应配 reducer；如果是聚合字段偶尔需要清空或替换，应显式返回 `Overwrite(value=...)`。
 
 managed value 不是 channel，它通过 `_get_channels()` 中专门的分支处理，不进入 IO schema，但节点可以读到（例如 `RemainingSteps` 用来感知剩余递归预算）。
+
+## Reducer 覆盖：`Overwrite`
+
+有 reducer 的字段默认会走聚合语义。例如 `Annotated[list, operator.add]` 会追加列表，`add_messages` 会按消息 ID 合并。这在大多数并发场景是正确的，但也有少数节点需要表达“这次不是追加，而是把这个聚合字段整体替换掉”，例如压缩消息历史、清空临时结果、重置累加器。
+
+当前实现提供 `langgraph.types.Overwrite` 处理这个需求：
+
+```python
+from typing_extensions import Annotated, TypedDict
+import operator
+from langgraph.types import Overwrite
+
+
+class State(TypedDict):
+    messages: Annotated[list[str], operator.add]
+
+
+def compact_messages(state: State) -> dict:
+    return {"messages": Overwrite(value=["summary"])}
+```
+
+`Overwrite` 只对 `BinaryOperatorAggregate` 和 `DeltaChannel` 这类支持覆盖语义的聚合 channel 有意义。它不是“随便让最后写入赢”的逃生口：同一 superstep 内同一个 channel 收到多个 `Overwrite` 会抛 `InvalidUpdateError`，防止两个并发节点都声称自己要重置同一份状态。
+
+设计启发：reducer 是默认合并规则，`Overwrite` 是显式的例外。业务代码应该让例外看得见，而不是把清空/替换藏在一个特殊 reducer 或隐式原地修改里。
 
 ## DeltaChannel：增量存储与可恢复重建
 
@@ -625,8 +654,10 @@ DeltaChannel 是这个仓库里比较新且有工程意义的设计。当 agent 
 
 - 非快照 step 的 `channel_values` 里不包含该 channel；该 step 的真实更新保存在 `checkpoint_writes` / `pending_writes` 里。
 - 每隔 `snapshot_frequency` 次更新（或达到 `DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT` 总步数上限）才把完整 `_DeltaSnapshot(value)` 写到 `channel_values[k]`。
-- 状态重建时由 `BaseCheckpointSaver.get_delta_channel_history(config, channels)` 沿 `parent_config` 往上走，累计每个 channel 的 writes，直到遇到最近的 snapshot，组合出当前值。
+- 状态重建时由 `BaseCheckpointSaver.get_delta_channel_history(config=..., channels=...)` 沿 `parent_config` 往上走，累计每个 channel 的 writes，直到遇到最近的 snapshot，组合出当前值。
 - metadata 中的 `counters_since_delta_snapshot[channel] = (updates, supersteps)` 控制何时强制 snapshot。
+- reducer 签名是 `reducer(state, list[writes]) -> new_state`，不是普通二元 `operator.add`。它必须确定性且对 batching 不敏感，因为恢复时可能把多步 writes 合批 replay。
+- `Overwrite` 在 `DeltaChannel` 中会成为 replay 的重置点：最后一个 `Overwrite` 之前的 delta 被忽略，从覆盖值之后继续应用后续 writes。
 
 这一设计带来两个运维约束，做自定义 checkpointer 时尤其要注意：
 
@@ -647,7 +678,7 @@ DeltaChannel 是这个仓库里比较新且有工程意义的设计。当 agent 
 
 LangGraph 用两个基础类型处理：
 
-- `Send(node, arg)`：向某个节点发送自定义输入，绕开常规 channel 路径，常用于动态 fan-out。每个 `Send` 在 Pregel 里就是一个独立 task。
+- `Send(node, arg, timeout=...)`：向某个节点发送自定义输入，绕开常规 channel 路径，常用于动态 fan-out。每个 `Send` 在 Pregel 里就是一个独立 task；可选 `timeout` 会覆盖这次 pushed task 的节点默认 timeout。
 - `Command(update=..., goto=..., resume=...)`：把状态更新、跳转、interrupt 恢复合在一个显式控制对象里。`goto` 可以是节点名，也可以是 `Send` 或它们的列表。
 
 这让节点（以及工具，见下文 `ToolNode`）的返回值不仅能表达“写了什么状态”，还能表达“下一步控制流怎么走”。但这些控制流仍然进入 Pregel 的 channel/task/checkpoint 机制，不会绕开运行时。
@@ -661,7 +692,7 @@ LangGraph 用两个基础类型处理：
 要点：
 
 - 父图在调度子图节点时，会给子图分配一个 `checkpoint_ns`（用 `|` 分隔的命名空间），checkpoint 表的主键里就含这个 ns（见下文 Postgres 表结构）。
-- 子图既可以**继承父图的 checkpointer**（默认；通过 ns 隔离命名空间），也可以传入独立的 checkpointer 形成完全隔离的存储。
+- 子图既可以**继承父图的 checkpointer**（默认；通过 ns 隔离命名空间），也可以传入独立的 checkpointer 形成完全隔离的存储；`checkpointer=False` 会显式禁用继承，`checkpointer=True` 只用于子图从父运行配置中启用持久化。
 - `Pregel.get_subgraphs(namespace=..., recurse=...)` 可以按 ns 检索运行中的子图，便于调试和管理。
 - `Send` 跨子图也成立：父图节点返回 `Send("subgraph_node", ...)` 时，子图 ns 会被正确拼接。
 
@@ -676,8 +707,10 @@ LangGraph 用两个基础类型处理：
 - 读：`get_tuple()` / `aget_tuple()`、`get()` / `aget()`（只取 checkpoint 不含 pending writes）、`list()` / `alist()`。
 - 写：`put()` / `aput()`、`put_writes()` / `aput_writes()`。
 - 生命周期：`delete_thread()`、`delete_for_runs()`、`copy_thread()`、`prune()` 及其 `a` 前缀异步版本。
-- 版本与重建：`get_next_version()`、`get_delta_channel_history()`。
+- 版本与重建：`get_next_version()`、`get_delta_channel_history()` / `aget_delta_channel_history()`。
 - 配置暴露：`config_specs` 告诉运行时该 checkpointer 接受哪些 `RunnableConfig` 字段（例如 `thread_id`, `checkpoint_id`, `checkpoint_ns`）。
+
+`checkpointer` 本身也有三个特殊 flag：`None` 表示子图默认继承父图 checkpointer；`False` 表示禁用继承；`True` 只适合子图，表示从父图运行配置里取得真实 saver，root graph 不能直接用 `checkpointer=True`。
 
 ### Checkpoint 内容
 
@@ -731,6 +764,7 @@ LangGraph 用两个基础类型处理：
 - `_msgpack.py`：性能更高的二进制路径。
 - `encrypted.py`：对序列化后的 checkpoint/blob 数据做加密包装；server 侧更细粒度的 JSON / 字段加密由 `langgraph_sdk.encryption` 的自定义 at-rest encryption 体系处理。
 - `event_hooks.py`：序列化 allowlist 事件挂钩，便于记录和审计反序列化安全事件。
+- `langgraph._internal._serde` 会在 strict msgpack 模式下基于 graph schema / channel 构建 allowlist，并在 compile 阶段包装 checkpointer。这个路径说明 schema 不只服务类型推断，也服务反序列化安全边界。
 
 SerDe 是跨进程 / 跨版本互操作和合规存储（blob 加密、自定义 JSON / 字段加密、PII 脱敏）的关键，不要轻易绕过。
 
@@ -743,8 +777,9 @@ SerDe 是跨进程 / 跨版本互操作和合规存储（blob 加密、自定义
 - `stream_writer`：写自定义 stream 事件（对应 `stream_mode="custom"`）。
 - `previous`：Functional API 中“上一次运行的返回值”。
 - `execution_info`：当前 step、task_id 等运行期信息。
+- `server_info`：LangGraph Server 注入的 assistant_id、graph_id、authenticated user 等服务端元信息；纯开源本地运行时通常为 `None`。
 - `heartbeat()`：长任务里手动告知运行时“我还活着”，配合 `TimeoutPolicy(refresh_on="heartbeat")` 防误判 idle 超时。
-- `control`：可选的运行控制接口（中止当前 run 等）。
+- `control`：可选的运行控制接口，当前主要用于 cooperative drain。节点可以读 `runtime.drain_requested` / `runtime.drain_reason`，长任务据此尽快收尾。
 
 `Runtime` 本身**不含 `RunnableConfig`**。要拿 `config`，要么在节点签名里加 `config: RunnableConfig`，要么用 `langgraph.config.get_config()`。
 
@@ -824,6 +859,20 @@ LangGraph 把 stream 做成运行时主路径，而不是事后加回调。`Stre
 
 实现上可以看到 `StreamMessagesHandler`, `StreamMessagesHandlerV2`, `StreamToolCallHandler`, `StreamMux`, 各类 stream transformer 等结构（`libs/langgraph/langgraph/pregel/_messages.py`、`libs/langgraph/langgraph/pregel/_tools.py`、`libs/langgraph/langgraph/stream/_mux.py`）。对 agent 项目来说，这一点很关键：生产 agent 的核心难点不是“能不能跑”，而是出错时能不能还原发生了什么。
 
+`stream()` / `astream()` 是常规数据流 API；`stream_events()` / `astream_events()` 还提供 LangChain Runnable 事件兼容层。当前代码里新增的 `version="v3"` 走 `langgraph.stream` 包里的 mux/transformer 管线，属于实验性 API，但它展示了下一层 observability 抽象：先把原始 stream part 统一成 `ProtocolEvent`，再由 transformer 投影成 `values`、`messages`、`tasks`、`checkpoints`、subgraph status 等更适合 UI 或控制面的通道。
+
+## Stream v3 与 transformer
+
+`libs/langgraph/langgraph/stream/` 下的 v3 streaming 设计值得单独看，因为它把“消费事件”变成了一个可扩展管线：
+
+- `StreamMux` 是中心分发器，给事件分配单调递增 `seq`，再按顺序交给一组 `StreamTransformer`。
+- `StreamTransformer` 可以声明自己需要哪些底层 `StreamMode`，也可以产生 `StreamChannel` 投影。内置 transformer 包括 values、updates、messages、custom、tasks、checkpoints、debug、lifecycle 和 subgraph 相关投影。
+- `GraphRunStream` / `AsyncGraphRunStream` 是调用方拿到的运行对象。它不是后台线程无限推送，而是由调用方迭代投影时驱动 graph 前进；projection 是单消费者，需要 fan-out 时用 channel 的 tee 能力。
+- `StateGraph.compile(transformers=[...])` 可以注册编译期 transformer，`graph.stream_events(..., version="v3", transformers=[...])` 也可以在调用点追加 transformer。工厂签名是 `(scope) -> StreamTransformer`，这样子图和嵌套调用能拿到自己的 namespace scope。
+- 对会修改事件内容的 transformer（例如 PII redaction），`before_builtins=True` 很重要，否则内置 `MessagesTransformer` 可能已经把原始文本投影出去了。
+
+设计启发：observability 不只是“把所有事件打印出来”。更好的结构是保留一个有序协议事件流，再允许不同消费者声明自己的投影：调试 UI 要 tasks/checkpoints，聊天 UI 要 messages/custom，治理层可能要经过脱敏后的内容流。
+
 ## 错误处理、重试、缓存和超时
 
 LangGraph 的节点策略是运行时一等配置（定义在 `langgraph/types.py`）：
@@ -842,7 +891,7 @@ LangGraph 的节点策略是运行时一等配置（定义在 `langgraph/types.p
 核心运行时解决“图如何在进程内执行”。CLI 和 SDK 解决“图如何作为应用交付”：
 
 - CLI（`libs/cli/langgraph_cli`）：读取 `langgraph.json`，创建项目、启动 dev server、构建 Docker image、生成 Dockerfile。它还负责解析依赖、注入 `langgraph-api` 运行时（这是 server-side 的真正承载组件，不在本仓库），并处理 uv lockfile、template、archive 等周边。
-- Python SDK（`libs/sdk-py/langgraph_sdk`）：调用远端 LangGraph API，管理 assistants、threads、runs、store、**cron**（定时任务，对自动化 agent 很重要）、auth、encryption 等资源；同时维护异步（`_async`）和同步（`_sync`）两套客户端，共享 `_shared` 的 schema 和工具。
+- Python SDK（`libs/sdk-py/langgraph_sdk`）：调用远端 LangGraph API，管理 assistants、threads、runs、store、**cron**（定时任务，对自动化 agent 很重要）、auth、encryption、远程 stream controller / transport 等资源；同时维护异步（`_async`）和同步（`_sync`）两套客户端，共享 `_shared` 的 schema 和工具。
 - JS SDK（`libs/sdk-js`）：仓库内仅保留迁移说明，实际代码在独立仓库 `langchain-ai/langgraphjs`。
 
 这说明 LangGraph 对 agent 的完整理解包含三层：
@@ -852,6 +901,15 @@ LangGraph 的节点策略是运行时一等配置（定义在 `langgraph/types.p
 3. 客户端 SDK 的远程调用和 streaming 协议。
 
 做自己的 agent 项目时，也要尽早区分“框架核心 API”和“应用部署/运维接口”。
+
+## RemoteGraph 和 Server/UI 扩展
+
+当前 `libs/langgraph` 里还有两个容易漏看的扩展点：
+
+- `RemoteGraph`（`libs/langgraph/langgraph/pregel/remote.py`）是对 LangGraph Server API 的本地 Runnable/PregelProtocol 封装。它通过 `langgraph-sdk` 调远端 assistant，可以像普通 graph 一样 `invoke` / `stream` / `get_state`，也可以作为父图中的一个 node。这个设计把“本地子图”和“远程部署图”统一到同一个组合模型里，但也意味着 `langgraph` 核心包在 production dependency 上依赖 `langgraph-sdk`。
+- `graph.ui`（`libs/langgraph/langgraph/graph/ui.py`）提供 `push_ui_message`、`delete_ui_message` 和 `ui_message_reducer`。它把 UI component 更新同时写入 custom stream 和 graph state（默认 state key 是 `ui`），适合服务端 graph 驱动 Studio/前端组件状态。它不是让 UI 变成特殊旁路，而是把 UI 更新也建模成 state update + stream event。
+
+设计启发：当 graph 进入服务化阶段，组合边界不再只是在同一 Python 进程内。`RemoteGraph` 让跨部署组合保留 Runnable 心智模型；UI helper 则让前端状态也能跟 checkpoint/stream 对齐，而不是另起一套不可恢复的 websocket side channel。
 
 ## 值得吸收的设计理念
 
@@ -881,7 +939,7 @@ LangGraph 不把 agent 固化为某一种架构。核心只提供 state、node�
 
 ### Runtime 注入比全局上下文更干净
 
-`Runtime` 和 `ToolRuntime` 把 context、store、stream_writer、execution_info、heartbeat、control 等运行期能力显式注入。这样节点和工具可以拿到依赖，但这些依赖不污染 state schema，也不会暴露给 LLM。
+`Runtime` 把 context、store、stream_writer、execution_info、heartbeat、server_info、control 等运行期能力显式注入；`ToolRuntime` 复用其中和工具相关的 context、store、stream_writer、execution_info，并额外带上 state、config、tool_call_id。这样节点和工具可以拿到依赖，但这些依赖不污染 state schema，也不会暴露给 LLM。
 
 ### Graph 可以是子图，子图仍是 Runnable
 
@@ -910,7 +968,8 @@ agent 系统越复杂，越需要这种结构化事件流。
 7. 为 human-in-the-loop 设计可恢复协议，避免在进程内阻塞等待。
 8. 给每个节点提供 retry/cache/timeout/error handler 的声明式策略，并区分“同节点重跑”、“失败转路由”、“跳过重算”、“资源回收”四类语义。
 9. 让 streaming 事件覆盖节点、工具、LLM token、checkpoint 和错误。
-10. 高层 agent 模板应该可拆、可换、可插 hook / middleware，并且要假设它会被独立版本演进。
+10. 如果要给前端或控制面消费事件，先定义稳定事件协议，再用 transformer / reducer 投影出 UI 需要的状态。
+11. 高层 agent 模板应该可拆、可换、可插 hook / middleware，并且要假设它会被独立版本演进。
 
 ## 推荐阅读顺序
 
@@ -924,13 +983,15 @@ agent 系统越复杂，越需要这种结构化事件流。
 6. `libs/langgraph/langgraph/types.py`：理解 `Send`, `Command`, `Interrupt`, `interrupt()`, `RetryPolicy`, `CachePolicy`, `TimeoutPolicy`, `StreamMode`, `Durability`。
 7. `libs/langgraph/langgraph/runtime.py`：理解 `Runtime` 注入、`heartbeat`、`execution_info` 等运行期接口。
 8. `libs/langgraph/langgraph/func/__init__.py`：理解 Functional API 如何编译到 Pregel，`@entrypoint` 与 `@task` 的关系。
-9. `libs/checkpoint/langgraph/checkpoint/base/__init__.py`：理解持久化协议、`CheckpointMetadata`、`get_delta_channel_history` 等接口。
-10. `libs/checkpoint/langgraph/cache/base/__init__.py` 和 `serde/jsonplus.py`：理解节点缓存与序列化协议。
-11. `libs/checkpoint-postgres/langgraph/checkpoint/postgres/base.py` 与 `shallow.py`：理解生产 checkpoint 的两种实现取舍。
-12. `libs/checkpoint-conformance/...`：理解 checkpointer 行为规范。
-13. `libs/prebuilt/langgraph/prebuilt/tool_node.py`：理解工具节点如何做并行执行、注入和错误处理。
-14. `libs/prebuilt/langgraph/prebuilt/chat_agent_executor.py`：把 ReAct agent 看成 graph primitives 的组合（注意是 deprecated 参考实现）。
-15. `libs/cli` 和 `libs/sdk-py`：最后再看服务化和交付层。
+9. `libs/langgraph/langgraph/stream/`：理解 `StreamMux`、`StreamTransformer`、`GraphRunStream` 如何把底层 stream 投影成 UI/控制面可消费的通道。
+10. `libs/langgraph/langgraph/pregel/remote.py` 和 `graph/ui.py`：理解远程 graph 组合与 UI state update 如何复用 Runnable、stream 和 state 语义。
+11. `libs/checkpoint/langgraph/checkpoint/base/__init__.py`：理解持久化协议、`CheckpointMetadata`、`get_delta_channel_history` 等接口。
+12. `libs/checkpoint/langgraph/cache/base/__init__.py` 和 `serde/jsonplus.py`：理解节点缓存与序列化协议。
+13. `libs/checkpoint-postgres/langgraph/checkpoint/postgres/base.py` 与 `shallow.py`：理解生产 checkpoint 的两种实现取舍。
+14. `libs/checkpoint-conformance/...`：理解 checkpointer 行为规范。
+15. `libs/prebuilt/langgraph/prebuilt/tool_node.py`：理解工具节点如何做并行执行、注入和错误处理。
+16. `libs/prebuilt/langgraph/prebuilt/chat_agent_executor.py`：把 ReAct agent 看成 graph primitives 的组合（注意是 deprecated 参考实现）。
+17. `libs/cli` 和 `libs/sdk-py`：最后再看服务化和交付层。
 
 ## 最值得记住的抽象
 
@@ -939,14 +1000,16 @@ State schema    决定数据形状
 Channel         决定状态更新语义（含 LastValue / Aggregate / Topic / Barrier / Delta 等多种）
 Node            决定局部计算
 Edge / Branch / Send / Command  决定控制流
+Overwrite       决定何时显式绕过 reducer 替换聚合状态
 Pregel superstep                决定并发边界
 Checkpoint      决定恢复能力（含 pending writes 与 versions_seen）
 Store           决定跨线程长期记忆
-Runtime         决定运行期依赖注入（含 context、stream_writer、heartbeat）
-Stream          决定可观察性
+Runtime         决定运行期依赖注入（含 context、stream_writer、heartbeat、server_info、control）
+Stream          决定可观察性；StreamTransformer 决定事件投影
 Cache           决定节点级幂等优化
 SerDe           决定持久化的格式、安全和互操作
 Prebuilt agent  决定常见模式的默认组合（正在向 langchain middleware 体系演进）
+RemoteGraph     决定远程部署图如何参与本地图组合
 ```
 
 LangGraph 的精髓在于：它没有把 agent 看作一次函数调用，而是看作一个可持久化的分布式状态机。LLM 只是节点之一，工具只是节点之一，人工也是控制流的一部分，所有东西都回到同一套状态、调度、checkpoint 和 stream 机制里。
