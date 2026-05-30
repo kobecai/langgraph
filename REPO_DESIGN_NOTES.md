@@ -17,7 +17,7 @@
 - [`Send` 和 `Command`：动态控制流](#send-和-command动态控制流)
 - [Subgraph 与 namespace](#subgraph-与-namespace)
 - [Checkpoint 持久化协议](#checkpoint-持久化协议)
-- [Cache 与 SerDe](#cache-与-serde)
+- [Store / Cache / SerDe](#store--cache--serde)
 - [Runtime 注入：`Runtime` 与 `ToolRuntime`](#runtime-注入runtime-与-toolruntime)
 - [Prebuilt agent 的真实位置（含 deprecation 说明）](#prebuilt-agent-的真实位置含-deprecation-说明)
 - [Functional API 的定位](#functional-api-的定位)
@@ -713,6 +713,63 @@ LangGraph 用两个基础类型处理：
 
 `checkpointer` 本身也有三个特殊 flag：`None` 表示子图默认继承父图 checkpointer；`False` 表示禁用继承；`True` 只适合子图，表示从父图运行配置里取得真实 saver，root graph 不能直接用 `checkpointer=True`。
 
+### Checkpoint 读路径：运行时何时调用 `get_tuple()`
+
+主运行时几乎不会直接调 `get()`，而是优先调 `get_tuple()`。原因很直接：恢复执行不只需要 `checkpoint` 本身，还需要 `metadata`、`parent_config` 和 `pending_writes`。这条读链路的同步入口在 `SyncPregelLoop.__enter__()`，异步入口在 `AsyncPregelLoop.__aenter__()`。
+
+核心调用顺序是：
+
+1. `Pregel.stream()` / `Pregel.astream()` 创建 `SyncPregelLoop` 或 `AsyncPregelLoop`。
+2. `__enter__` / `__aenter__` 根据配置决定读哪一个 checkpoint：
+  - 如果 `config` 里显式带 `checkpoint_id`，直接 `checkpointer.get_tuple(checkpoint_config)`，这条路径服务 replay / time travel。
+  - 如果当前是子图 replay，则由 `ReplayState.get_checkpoint(...)` 结合父图传下来的 `checkpoint_map` 解析出本子图应该读的 checkpoint。
+  - 普通执行则直接 `get_tuple()` 取该 `thread_id + checkpoint_ns` 下的最新 checkpoint。
+3. 读回来的 `CheckpointTuple.pending_writes` 会被放进 `self.checkpoint_pending_writes`。这一步是 durable execution 的关键：恢复时 loop 能知道哪些 task 已经成功写过结果，避免重复执行。
+4. `channels_from_checkpoint()` / `achannels_from_checkpoint()` 再把 `checkpoint["channel_values"]` 还原成 live channels。如果某个 key 是 `DeltaChannel`，而当前 checkpoint 里没有完整值，它会批量调用 `saver.get_delta_channel_history(config=..., channels=...)`，找到最近 seed，然后 replay ancestor writes 重建当前值。
+
+这条链路里有两个很值得记住的实现细节：
+
+- `saved is None` 时，loop 不会分叉到一条单独的“首次运行逻辑”，而是构造 `CheckpointTuple(checkpoint_config, empty_checkpoint(), {"step": -2}, None, [])` 作为统一起点。这样首次运行、恢复运行、time travel 后续都走同一套 `_first()` / `tick()` 路径。
+- `BaseCheckpointSaver.get_delta_channel_history()` 的默认实现并不依赖底层 SQL，而是沿 `parent_config` 反复 `get_tuple()` 向上走；`InMemorySaver`、Postgres 等具体 saver 可以 override 这条逻辑，直接扫底层存储，只遍历一次父链来提高性能。
+
+因此，runtime 主路径真正依赖的是 `get_tuple()`，不是 `get()`；`get()` 更像一个 convenience wrapper，而 `list()` 更多给 state history / time travel 之类的上层接口使用。
+
+### Checkpoint 写路径：`put_writes()` 和 `put()` 的分工
+
+LangGraph 把 checkpoint 写入拆成两层：
+
+- `put_writes()`：task 级中间写入。发生在单个 task 结束时，还没跨过 superstep barrier。
+- `put()`：superstep 级稳定快照。发生在 `after_tick()` 完成 `apply_writes()` 之后。
+
+这条写链路的核心代码顺序是：
+
+1. `PregelRunner.commit()` 在每个 task 结束时立刻调用 `self.put_writes()(task.id, task.writes)`。
+  - 正常完成时，如果 task 没有任何 writes，会补一条 `NO_WRITES` 标记。
+  - 遇到 `GraphInterrupt` 时，会写入 `INTERRUPT`；如果 task 已带 `RESUME`，也会一起持久化。
+  - 普通异常时，会写入 `ERROR`；若该节点配置了 graph-level `error_handler`，还会额外写入 `ERROR_SOURCE_NODE`，这样恢复后可以直接调度 handler，而不是重跑原节点。
+2. `PregelLoop.put_writes()` 先把数据放进 `checkpoint_pending_writes`，然后再异步持久化到 saver。这里会做几层清洗：
+  - 对 `ERROR`、`SCHEDULED`、`INTERRUPT`、`RESUME` 这类特殊写入用 `WRITES_IDX_MAP = {ERROR: -1, SCHEDULED: -2, INTERRUPT: -3, RESUME: -4}` 去重，保证“同一 task 的同类系统写入最后一次生效”。
+  - 过滤 `UntrackedValue`，因为这些运行期对象不应该进入 checkpoint。
+  - 对 `DeltaChannel` 上的消息先做 `ensure_message_ids()`，避免 reducer 在 replay 时临时生成新 ID，导致每次恢复状态都不稳定。
+  - 然后调用 saver 的 `put_writes(config, writes_to_save, task_id, task_path?)`；这里的 `config` 会被 patch 成“当前 checkpoint id + 当前 namespace”。
+3. 一个 superstep 的所有 task 完成后，`PregelLoop.after_tick()` 调 `apply_writes()` 把内存里的 writes 合并进 channels，推进 `channel_versions`，然后清空 `checkpoint_pending_writes` 并调用 `_put_checkpoint({"source": "loop"})`。
+4. `_put_checkpoint()` 内部先调用 `create_checkpoint()` 基于当前 live channels 构造新的 `Checkpoint`，再计算 `new_versions = get_new_channel_versions(old_versions, new_versions)`，最后把 `checkpointer.put(config, copy_checkpoint(checkpoint), metadata, new_versions)` 挂到后台执行。
+5. `SyncPregelLoop._checkpointer_put_after_previous()` / `AsyncPregelLoop._checkpointer_put_after_previous()` 会先等待两个东西：上一个 checkpoint future，以及所有 delta-channel 的 `put_writes` future。只有它们都完成，新的 `put()` 才会真正执行。这保证了“一个正式 checkpoint 变得可见时，支撑它的 writes 已经 durable”。
+
+这条分层写入的意义是：LangGraph 不会把“节点刚返回的结果”立即当成全局稳定状态，而是先把 task writes durable，再在 barrier 后写正式 checkpoint。失败恢复时，读回的是“稳定快照 + 挂在其上的 pending writes”，不是半应用的脏状态。
+
+### `InMemorySaver` 的读写细节
+
+`InMemorySaver` 把这套协议拆成三张内存表，结构非常直观：
+
+- `storage[thread_id][checkpoint_ns][checkpoint_id] = (checkpoint_without_channel_values, metadata, parent_checkpoint_id)`
+- `blobs[(thread_id, checkpoint_ns, channel, version)] = serde.dumps_typed(value)`
+- `writes[(thread_id, checkpoint_ns, checkpoint_id)][(task_id, idx)] = (task_id, channel, serialized_value, task_path)`
+
+读时，`get_tuple()` 先从 `storage` 里拿到 checkpoint 主体，再用 `_load_blobs(thread_id, checkpoint_ns, checkpoint_["channel_versions"])` 回填 `channel_values`，最后从 `writes[...]` 解码出 `pending_writes`。这也解释了为什么 saver 接口里的 `put()` 还要接收 `new_versions`：只有本次新增 version 对应的 channel blob 需要写入，老版本 blob 可以继续复用。
+
+写时，`put()` 会先把 `checkpoint.copy()` 里的 `channel_values` 拿出来，只把 `new_versions` 对应的 `(channel, version)` 写进 `blobs`；真正进 `storage` 的 checkpoint 主体是不带 `channel_values` 的轻量记录。`put_writes()` 则按 `(task_id, idx)` 存入 `writes`，其中 `idx` 对系统 channel 会复用 `WRITES_IDX_MAP`，从而达到幂等去重的效果。
+
 ### Checkpoint 内容
 
 `Checkpoint` 是个 `TypedDict`，主要字段：
@@ -744,9 +801,46 @@ LangGraph 用两个基础类型处理：
 
 设计启发：如果你的 agent 框架允许用户换数据库，就要提供合规测试套件。否则“接口兼容”很容易只停留在方法名一致。
 
-## Cache 与 SerDe
+## Store / Cache / SerDe
 
-这两个子系统不在主心智模型里，但要做生产 agent 一定会撞上。
+这三个子系统不在主心智模型里，但要做生产 agent 一定会撞上。
+
+### Store 子系统：调用时机与核心代码
+
+Store 和 checkpointer/cache 最大的不同是：checkpointer/cache 都在 Pregel 主循环里被 runtime 主动读写，而 store 主要由业务节点或工具主动调用。框架做的事情不是“每个 superstep 自动 search/put”，而是把 store 变成一个可安全注入的运行期依赖。
+
+调用时机可以分成两层：
+
+1. graph 编译和任务构造阶段把 `store` 注入 runtime。
+2. 节点或工具在自己的业务逻辑里显式调用 `store.get/search/put/batch`。
+
+第一层的核心代码在 Pregel 任务构造路径：
+
+- `StateGraph.compile(store=store)` 最终把 store 透传给 `Pregel` / `PregelLoop`。
+- `prepare_next_tasks()` / `prepare_single_task()` 在构造 `PregelExecutableTask` 时会做 `runtime.override(store=store, execution_info=...)`，所以普通 graph node 拿到的 `Runtime.store` 就是这里塞进去的。
+- 工具路径里，`ToolNode._func()` / `_afunc()` 会先构造 `ToolRuntime(state=..., tool_call_id=..., config=..., context=runtime.context, store=runtime.store, ...)`。
+- 接着 `_inject_tool_args()` 会根据工具签名里的 `InjectedStore` / `ToolRuntime` 注解，把 `tool_runtime.store` 注入具体参数；如果工具声明了 `InjectedStore`，但 graph 没有 `compile(store=...)`，这里会直接抛错。
+
+第二层的核心代码在 `BaseStore` 本身：单操作 API 其实全都是 `batch()` / `abatch()` 的语法糖。
+
+- `get()` 实际上是 `batch([GetOp(...)])[0]`
+- `search()` 实际上是 `batch([SearchOp(...)])[0]`
+- `put()` 实际上是 `batch([PutOp(...)])`
+- async 版本同理全部下沉到 `abatch(...)`
+
+这意味着真正需要由 store adapter 实现的核心只有 `batch()` / `abatch()`。它们是 store 的真正抽象边界：
+
+- 结构化查询、语义检索、TTL 刷新和 namespace 权限都可以统一在这里做。
+- `put()` 里的 `index` 参数只是把“要不要建向量索引、建哪些字段”编码进 `PutOp`，真正是否支持向量检索由具体 adapter 决定。
+- `search()` 里的 `query + filter + limit/offset` 组合，也是在 `SearchOp` 层统一表达，再由 adapter 决定怎么映射到底层数据库或向量引擎。
+
+如果 store 后端本身是异步资源，`AsyncBatchedBaseStore` 又在 `BaseStore` 之上加了一层后台批处理：
+
+- `aget/asearch/aput/...` 会把 `GetOp` / `SearchOp` / `PutOp` 丢进 `_aqueue`。
+- 后台 `_run(...)` 负责聚合这些 op，再调用一次 `abatch(dedupped)`。
+- 同步 `get/search/put/batch` 则通过 `asyncio.run_coroutine_threadsafe(...)` 转发到同一个 event loop，并用 `_check_loop` 主动阻止“在主 event loop 里误用同步 API”这种容易 deadlock 的调用。
+
+所以，Store 的调用时机并不是由 Pregel 主循环决定的，而是由你的业务逻辑决定的：检索长期记忆时显式 `search()`，写用户偏好或摘要时显式 `put()`，需要减少 round-trip 时直接走 `batch()` / `abatch()`。框架保证的是注入、隔离和一致的抽象边界。
 
 ### Cache 子系统
 
@@ -756,6 +850,23 @@ LangGraph 用两个基础类型处理：
   - `key_func` 默认基于 pickle 哈希节点输入，但**生产环境通常需要自定义**——一方面避免 pickle 不稳定的对象，另一方面对敏感字段排除。
   - 命中缓存时节点不再执行，但缓存值仍会通过常规 channel writes 写入，从而保证 superstep 一致性。
 - `CachePolicy` 不会被 error_handler 节点继承，因为缓存错误处理是不安全的。
+
+更精确地说，LangGraph 缓存的不是“函数返回值”，而是“task 最终产出的 writes”。这也是为什么缓存命中后，Pregel 可以像处理真实节点执行结果一样，直接把这些 writes 接进后续调度和 stream。
+
+核心调用时机分三步：
+
+1. 生成 cache key：
+  - 在 `prepare_single_task()`、`prepare_call_task()`、`prepare_push_task_send()` 这些任务构造函数里，如果节点或 call 带 `cache_policy`，会先用 `cache_policy.key_func(...)` 计算参数 key。
+  - 然后拼成 `CacheKey((CACHE_NS_WRITES, identifier(proc), name), xxh3_128_hexdigest(args_key), ttl)`。也就是说，命名空间里明确写着它缓存的是 writes，而不是原始输出对象。
+2. 读取缓存：
+  - `SyncPregelLoop.match_cached_writes()` / `AsyncPregelLoop.amatch_cached_writes()` 会收集所有“有 `cache_key` 且 `task.writes` 仍为空”的任务，批量调用 `cache.get()` / `cache.aget()`。
+  - 命中后直接 `task.writes.extend(values)`，随后 `output_writes(..., cached=True)` 把它们当作这个 task 已经执行完成的结果发出去。
+  - 这一步不只发生在普通 tick 之后；`accept_push()` 动态创建任务、`schedule_error_handler()` 创建 handler task 之后，也会再次跑一遍缓存匹配。所以动态 fan-out 出来的任务一样能命中 cache。
+3. 回写缓存：
+  - `SyncPregelLoop.put_writes()` / `AsyncPregelLoop.put_writes()` 在把 writes 记入 checkpointer 之后，如果这个 task 有 `cache_key`，会调用 `cache.set()` / `cache.aset()`，把 `(task.cache_key.ns, task.cache_key.key) -> (task.writes, ttl)` 写进去。
+  - async 路径会显式跳过 `INTERRUPT` / `ERROR` 开头的写入，只缓存成功 task；sync 路径虽然没有单独这条判断，但 `commit()` 的调用语义决定了真正稳定命中的通常也是成功结果。
+
+`InMemoryCache` 的实现也很说明问题：内部结构是 `_cache[namespace][key] = (enc, bytes, expiry)`。`get()` 时会检查 TTL，过期就删除；未过期才 `serde.loads_typed(...)` 反序列化。这说明 cache 不是一个“随手塞 Python 对象”的 dict，而是和 checkpointer 一样有清晰的序列化与生命周期边界。
 
 ### SerDe 子系统
 
